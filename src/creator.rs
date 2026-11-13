@@ -211,9 +211,23 @@ impl Par2Creator {
     }
 
     /// Set redundancy percentage (default: 5.0)
-    pub fn with_redundancy(mut self, percent: f32) -> Self {
+    ///
+    /// Must be a finite, non-negative value (e.g., 0.0 for verification-only,
+    /// 5.0 for 5% redundancy, 100.0 for full redundancy).
+    pub fn with_redundancy(mut self, percent: f32) -> Result<Self> {
+        if percent.is_nan() || percent.is_infinite() {
+            return Err(Par2Error::InvalidFormat(
+                "Redundancy percentage must be a finite number".to_string(),
+            ));
+        }
+        if percent < 0.0 {
+            return Err(Par2Error::InvalidFormat(format!(
+                "Redundancy percentage cannot be negative (got {})",
+                percent
+            )));
+        }
         self.redundancy_percent = percent;
-        self
+        Ok(self)
     }
 
     /// Set output path (default: first_file.par2)
@@ -255,8 +269,21 @@ impl Par2Creator {
         );
 
         // Step 1: Compute file hashes in parallel (Phase 1 optimization)
-        let file_metadata = compute_file_hashes_parallel(&self.input_files)?;
+        let mut file_metadata = compute_file_hashes_parallel(&self.input_files)?;
         let total_size: u64 = file_metadata.iter().map(|m| m.length).sum();
+
+        // Establish the canonical PAR2 input-block ordering BEFORE numbering any
+        // blocks. par2cmdline numbers input blocks in File ID order, comparing the
+        // 16-byte File ID as a LITTLE-ENDIAN value (byte 15 first). We must use the
+        // same order for (a) block numbering -> Reed-Solomon constant assignment and
+        // (b) the Main packet File ID list, so that our own output round-trips and
+        // is interoperable with par2cmdline. Sorting here keeps the creator
+        // self-consistent regardless of the order files were supplied in.
+        file_metadata.sort_by(|a, b| {
+            let ia = compute_file_id(&a.hash_16k, a.length, &a.name);
+            let ib = compute_file_id(&b.hash_16k, b.length, &b.name);
+            crate::parser::cmp_file_id_par2(&ia, &ib)
+        });
 
         let block_size = self
             .block_size
@@ -420,18 +447,12 @@ impl Par2Creator {
         tracing::info!("Finalizing recovery blocks");
         let recovery_result = encoder.finalize();
 
-        // Step 6: Build main packet body and compute recovery set ID
+        // Step 6: Build main packet body and compute recovery set ID.
+        // Use the SAME canonical Main packet body builder that write_main_packet
+        // uses, so the recovery_set_id (MD5 of the body) matches the bytes actually
+        // written, and the File ID ordering is the canonical par2cmdline order.
         let file_ids: Vec<FileHash> = file_infos.iter().map(|f| f.file_id).collect();
-        let mut main_body = Vec::new();
-        main_body.extend_from_slice(&block_size.to_le_bytes());
-        main_body.extend_from_slice(&(file_infos.len() as u32).to_le_bytes());
-
-        let mut sorted_ids = file_ids.clone();
-        sorted_ids.sort_unstable();
-        for id in &sorted_ids {
-            main_body.extend_from_slice(id);
-        }
-
+        let main_body = writer::build_main_packet_body(block_size, &file_ids)?;
         let recovery_set_id = compute_recovery_set_id(&main_body);
 
         // Step 7: Split recovery blocks into volumes

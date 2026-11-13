@@ -19,6 +19,7 @@ use crate::galois::core::{
     debug_assert_tables_initialized, gf_mul, initialize_mul128_table, LOG_TABLE, MUL128_TABLE,
 };
 use std::arch::aarch64::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// NEON table-based GF(2^16) multiplication on a slice.
 ///
@@ -154,7 +155,6 @@ unsafe fn neon_mul_128(
 /// **Performance**: ~2-3x faster than table-based multiplication on ARM64.
 ///
 /// **Requirements**: ARM64 with NEON support (standard on all AArch64 CPUs).
-
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn pmull_low_asm(a: poly8x16_t, b: poly8x16_t) -> poly16x8_t {
@@ -517,9 +517,8 @@ pub unsafe fn gf_muladd_multi_pmull_neon(
     sources: &[&[u16]],
     coefficients: &[u16],
 ) {
-    static mut CALL_COUNT: usize = 0;
-    CALL_COUNT += 1;
-    if CALL_COUNT == 1 {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
         tracing::debug!(
             sources = sources.len(),
             dst_len = dst.len(),
